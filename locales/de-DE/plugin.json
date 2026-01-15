@@ -316,6 +316,8 @@
   "dev.title.create": "Benutzerdefinierten Skill hinzufügen",
   "dev.title.edit": "Benutzerdefinierten Skill bearbeiten",
   "dev.title.editCommunity": "Community-Fähigkeit bearbeiten",
+  "dev.title.skillDetails": "Fähigkeitsdetails",
+  "dev.title.skillSettings": "Fähigkeitseinstellungen",
   "dev.type.lobe": "{{appName}} Skill",
   "dev.type.openai": "OpenAI Skill",
   "dev.update": "Aktualisieren",
