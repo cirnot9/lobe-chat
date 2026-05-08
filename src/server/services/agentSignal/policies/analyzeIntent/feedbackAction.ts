@@ -2,6 +2,7 @@ import type {
   RuntimeDispatchProcessorResult,
   RuntimeProcessorResult,
 } from '@lobechat/agent-signal';
+import { AGENT_SIGNAL_SOURCE_TYPES } from '@lobechat/agent-signal/source';
 
 import type {
   AgentSignalProcedureMarker,
@@ -23,15 +24,15 @@ import {
 } from '../../processors/procedure';
 import type { RuntimeProcessorContext } from '../../runtime/context';
 import { defineSignalHandler } from '../../runtime/middleware';
-import type { AgentSignalActionServices } from '../../services/actionServices';
+import type {
+  AgentSignalActionServices,
+  NonSatisfiedSkillActionServiceSignal,
+} from '../../services/actionServices';
 import { createDefaultActionServices } from '../../services/actionServices';
 import type { ProcedureMarkerSuppressInput, ProcedureStateService } from '../../services/types';
-import type {
-  AgentSignalFeedbackSatisfactionResult,
-  SignalFeedbackDomainMemory,
-  SignalFeedbackDomainSkill,
-} from '../types';
+import type { SignalFeedbackDomainMemory } from '../types';
 import { AGENT_SIGNAL_POLICY_SIGNAL_TYPES } from '../types';
+import type { DeferredSkillCandidate } from './skillCandidate';
 
 /**
  * Weak positive skill feedback needs repeated observations before the accumulator emits.
@@ -83,26 +84,54 @@ export interface FeedbackActionPlannerOptions {
   procedure?: FeedbackActionProcedureDeps;
 }
 
-const isSatisfiedSkillSignal = (
-  signal: FeedbackDomainSignal,
-): signal is SatisfiedSkillFeedbackDomainSignal => {
-  return signal.payload.target === 'skill' && signal.payload.satisfactionResult === 'satisfied';
-};
-
 const isMemorySignal = (signal: FeedbackDomainSignal): signal is SignalFeedbackDomainMemory => {
   return signal.payload.target === 'memory';
 };
 
-const isNonSatisfiedSkillSignal = (
+const isDirectSkillDecisionSignal = (
   signal: FeedbackDomainSignal,
-): signal is SignalFeedbackDomainSkill & {
-  payload: SignalFeedbackDomainSkill['payload'] & {
-    satisfactionResult: Exclude<AgentSignalFeedbackSatisfactionResult, 'satisfied'>;
-    target: 'skill';
-  };
-} => {
-  return signal.payload.target === 'skill' && signal.payload.satisfactionResult !== 'satisfied';
+): signal is NonSatisfiedSkillActionServiceSignal => {
+  if (signal.payload.target !== 'skill') return false;
+  if (signal.payload.skillRoute === 'direct_decision') return true;
+
+  return (
+    signal.payload.satisfactionResult !== 'satisfied' && signal.payload.skillRoute !== 'non_skill'
+  );
 };
+
+const isAccumulatingSkillSignal = (
+  signal: FeedbackDomainSignal,
+): signal is SatisfiedSkillFeedbackDomainSignal => {
+  return (
+    signal.payload.target === 'skill' &&
+    signal.payload.satisfactionResult === 'satisfied' &&
+    signal.payload.skillRoute !== 'direct_decision' &&
+    signal.payload.skillRoute !== 'non_skill'
+  );
+};
+
+const shouldDeferSkillMutationUntilClientCompletion = (signal: FeedbackDomainSignal) => {
+  return signal.payload.trigger === AGENT_SIGNAL_SOURCE_TYPES.clientRuntimeStart;
+};
+
+const createDeferredSkillCandidate = (
+  signal: NonSatisfiedSkillActionServiceSignal,
+  context: RuntimeProcessorContext,
+): DeferredSkillCandidate => ({
+  ...(signal.payload.skillActionIntent ? { actionIntent: signal.payload.skillActionIntent } : {}),
+  ...(typeof signal.payload.skillIntentConfidence === 'number'
+    ? { confidence: signal.payload.skillIntentConfidence }
+    : { confidence: signal.payload.confidence }),
+  createdAt: context.now(),
+  explicitness: signal.payload.skillIntentExplicitness ?? 'weak_positive',
+  feedbackMessageId: signal.payload.messageId,
+  ...(signal.payload.skillIntentReason || signal.payload.reason
+    ? { reason: signal.payload.skillIntentReason ?? signal.payload.reason }
+    : {}),
+  route: signal.payload.skillRoute ?? 'accumulate',
+  scopeKey: context.scopeKey,
+  sourceId: signal.source?.sourceId ?? signal.signalId,
+});
 
 const createPlannerProcedureState = (
   options: FeedbackActionPlannerOptions,
@@ -318,7 +347,18 @@ export const createFeedbackActionPlannerSignalHandler = (
         };
       }
 
-      if (isNonSatisfiedSkillSignal(signal)) {
+      if (isDirectSkillDecisionSignal(signal)) {
+        if (shouldDeferSkillMutationUntilClientCompletion(signal)) {
+          await options.procedure?.procedureState?.skillCandidates?.write(
+            createDeferredSkillCandidate(signal, procedureContext),
+          );
+
+          return {
+            concluded: { reason: 'skill mutation deferred until client.runtime.complete' },
+            status: 'conclude',
+          };
+        }
+
         const plan = actionServices.skillActions.prepare(signal);
 
         return {
@@ -327,7 +367,7 @@ export const createFeedbackActionPlannerSignalHandler = (
         };
       }
 
-      if (isSatisfiedSkillSignal(signal)) {
+      if (isAccumulatingSkillSignal(signal)) {
         return handleSatisfiedSkillFeedback(signal, procedureContext, options, procedureState);
       }
     },

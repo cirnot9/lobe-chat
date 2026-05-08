@@ -4,10 +4,11 @@ import { createStaticStyles, cx } from 'antd-style';
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import { FileTextIcon, GlobeIcon, type LucideIcon, Trash2Icon } from 'lucide-react';
-import { memo, type MouseEvent, useMemo, useState } from 'react';
+import { type CSSProperties, memo, type MouseEvent, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMatch, useNavigate } from 'react-router-dom';
 
+import { DocumentExplorerTree } from '@/features/AgentDocumentsExplorer';
 import { useClientDataSWR } from '@/libs/swr';
 import { agentDocumentService, agentDocumentSWRKeys } from '@/services/agentDocument';
 import { useAgentStore } from '@/store/agent';
@@ -116,7 +117,12 @@ const DocumentItem = memo<DocumentItemProps>(({ agentId, document, mutate }) => 
   const description = document.description ?? undefined;
   const isWeb = document.sourceType === 'web';
   const IconComponent: LucideIcon = isWeb ? GlobeIcon : FileTextIcon;
-  const createdAtLabel = document.createdAt ? dayjs(document.createdAt).fromNow() : null;
+  const updatedAtLabel = document.updatedAt
+    ? t('workingPanel.resources.updatedAt', {
+        ns: 'chat',
+        time: dayjs(document.updatedAt).fromNow(),
+      })
+    : null;
 
   const activeDocumentId = pageMatch ? pageMatch.params.docId : portalDocumentId;
   const isActive = activeDocumentId === document.documentId;
@@ -190,7 +196,7 @@ const DocumentItem = memo<DocumentItemProps>(({ agentId, document, mutate }) => 
             {description}
           </Text>
         )}
-        {createdAtLabel && <Text className={styles.meta}>{createdAtLabel}</Text>}
+        {updatedAtLabel && <Text className={styles.meta}>{updatedAtLabel}</Text>}
       </Flexbox>
     </Flexbox>
   );
@@ -199,10 +205,11 @@ const DocumentItem = memo<DocumentItemProps>(({ agentId, document, mutate }) => 
 DocumentItem.displayName = 'AgentDocumentsGroupItem';
 
 interface AgentDocumentsGroupProps {
+  style?: CSSProperties;
   viewMode?: 'list' | 'tree';
 }
 
-const AgentDocumentsGroup = memo<AgentDocumentsGroupProps>(({ viewMode = 'list' }) => {
+const AgentDocumentsGroup = memo<AgentDocumentsGroupProps>(({ style, viewMode = 'list' }) => {
   const { t } = useTranslation('chat');
   const agentId = useAgentStore((s) => s.activeAgentId);
   const [filter, setFilter] = useState<ResourceFilter>('all');
@@ -251,7 +258,9 @@ const AgentDocumentsGroup = memo<AgentDocumentsGroupProps>(({ viewMode = 'list' 
     );
   }
 
-  if (data.length === 0) {
+  // For filter==='documents' we still render the tree even when empty, so the
+  // toolbar (new folder / new doc) remains reachable.
+  if (data.length === 0 && filter !== 'documents') {
     return (
       <Center flex={1} gap={8} paddingBlock={24}>
         <Empty description={t('workingPanel.resources.empty')} icon={FileTextIcon} />
@@ -279,7 +288,7 @@ const AgentDocumentsGroup = memo<AgentDocumentsGroupProps>(({ viewMode = 'list' 
   }
 
   return (
-    <Flexbox gap={12}>
+    <Flexbox gap={12} style={style}>
       <Flexbox horizontal gap={4} role={'tablist'}>
         {FILTER_OPTIONS.map((option) => {
           const active = filter === option.value;
@@ -296,7 +305,16 @@ const AgentDocumentsGroup = memo<AgentDocumentsGroupProps>(({ viewMode = 'list' 
           );
         })}
       </Flexbox>
-      {filteredData.length === 0 ? (
+      {filter === 'documents' ? (
+        <Flexbox flex={1} style={{ minHeight: 0 }}>
+          <DocumentExplorerTree
+            agentId={agentId}
+            data={data}
+            mutate={mutate}
+            style={{ height: '100%' }}
+          />
+        </Flexbox>
+      ) : filteredData.length === 0 ? (
         <Center flex={1} gap={8} paddingBlock={24}>
           <Empty
             description={t('workingPanel.resources.empty')}

@@ -52,7 +52,7 @@ vi.mock('@/libs/swr', () => ({
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) =>
+    t: (key: string, options?: { time?: string }) =>
       (
         ({
           'workingPanel.resources.empty': 'No agent documents yet',
@@ -60,6 +60,7 @@ vi.mock('react-i18next', () => ({
           'workingPanel.resources.filter.all': 'All',
           'workingPanel.resources.filter.documents': 'Documents',
           'workingPanel.resources.filter.web': 'Web',
+          'workingPanel.resources.updatedAt': `Updated ${options?.time}`,
         }) as Record<string, string>
       )[key] || key,
   }),
@@ -68,6 +69,12 @@ vi.mock('react-i18next', () => ({
 vi.mock('react-router-dom', () => ({
   useMatch: () => useMatchMock(),
   useNavigate: () => useNavigateMock,
+}));
+
+vi.mock('@/features/AgentDocumentsExplorer', () => ({
+  DocumentExplorerTree: ({ data }: { data: unknown[] }) => (
+    <div data-doc-count={data.length} data-testid="document-explorer-tree" />
+  ),
 }));
 
 vi.mock('@/services/agentDocument', () => ({
@@ -129,6 +136,7 @@ describe('AgentDocumentsGroup', () => {
               sourceType: 'file',
               templateId: 'claw',
               title: 'Brief',
+              updatedAt: new Date(),
             },
           ],
           error: undefined,
@@ -142,9 +150,10 @@ describe('AgentDocumentsGroup', () => {
 
     render(<AgentDocumentsGroup />);
 
-    const item = await screen.findByText('Brief');
+    const item = screen.getByText('Brief');
     expect(item).toBeInTheDocument();
     expect(screen.getByText('A short brief')).toBeInTheDocument();
+    expect(screen.getByText('Updated a few seconds ago')).toBeInTheDocument();
 
     fireEvent.click(item);
     expect(openDocument).toHaveBeenCalledWith('doc-content-1');
@@ -162,6 +171,7 @@ describe('AgentDocumentsGroup', () => {
           sourceType: 'file',
           templateId: 'claw',
           title: 'Brief',
+          updatedAt: new Date(),
         },
         {
           createdAt: new Date('2026-04-16T00:00:00Z'),
@@ -172,6 +182,7 @@ describe('AgentDocumentsGroup', () => {
           sourceType: 'web',
           templateId: null,
           title: 'Example',
+          updatedAt: new Date(),
         },
       ],
       error: undefined,
@@ -183,15 +194,20 @@ describe('AgentDocumentsGroup', () => {
 
     expect(screen.getByText('Brief')).toBeInTheDocument();
     expect(screen.getByText('Example')).toBeInTheDocument();
+    expect(screen.queryByTestId('document-explorer-tree')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText('Web'));
 
     expect(screen.queryByText('Brief')).not.toBeInTheDocument();
     expect(screen.getByText('Example')).toBeInTheDocument();
+    expect(screen.queryByTestId('document-explorer-tree')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText('Documents'));
 
-    expect(screen.getByText('Brief')).toBeInTheDocument();
+    const tree = screen.getByTestId('document-explorer-tree');
+    expect(tree).toBeInTheDocument();
+    expect(tree).toHaveAttribute('data-doc-count', '2');
+    expect(screen.queryByText('Brief')).not.toBeInTheDocument();
     expect(screen.queryByText('Example')).not.toBeInTheDocument();
   });
 
@@ -211,6 +227,7 @@ describe('AgentDocumentsGroup', () => {
           sourceType: 'file',
           templateId: 'claw',
           title: 'Brief',
+          updatedAt: new Date(),
         },
       ],
       error: undefined,

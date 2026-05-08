@@ -1,14 +1,16 @@
 import type { AgentRuntimeContext, AgentState } from '@lobechat/agent-runtime';
 import { BUILTIN_AGENT_SLUGS, getAgentRuntimeConfig } from '@lobechat/builtin-agents';
 import { builtinSkills } from '@lobechat/builtin-skills';
+import { LobeAgentManifest } from '@lobechat/builtin-tool-lobe-agent';
 import { LocalSystemManifest } from '@lobechat/builtin-tool-local-system';
 import { MessageToolIdentifier } from '@lobechat/builtin-tool-message';
 import { PageAgentIdentifier } from '@lobechat/builtin-tool-page-agent';
+import type { DeviceAttachment } from '@lobechat/builtin-tool-remote-device';
+import { generateSystemPrompt, RemoteDeviceManifest } from '@lobechat/builtin-tool-remote-device';
 import {
-  type DeviceAttachment,
-  generateSystemPrompt,
-  RemoteDeviceManifest,
-} from '@lobechat/builtin-tool-remote-device';
+  injectSelfIterationIntentTool,
+  shouldExposeSelfIterationIntentTool,
+} from '@lobechat/builtin-tool-self-iteration';
 import { TaskIdentifier } from '@lobechat/builtin-tool-task';
 import { builtinTools, manualModeExcludeToolIds } from '@lobechat/builtin-tools';
 import { LOADING_FLAT } from '@lobechat/const';
@@ -49,25 +51,25 @@ import { ThreadModel } from '@/database/models/thread';
 import { TopicModel } from '@/database/models/topic';
 import { UserModel } from '@/database/models/user';
 import { UserPersonaModel } from '@/database/models/userMemory/persona';
+import { toolsEnv } from '@/envs/tools';
 import { shouldEnableBuiltinSkill } from '@/helpers/skillFilters';
 import { signUserJWT } from '@/libs/trpc/utils/internalJwt';
-import {
-  createServerAgentToolsEngine,
-  type EvalContext,
-  type ServerAgentToolsContext,
-} from '@/server/modules/Mecha';
-import { type ServerUserMemoryConfig } from '@/server/modules/Mecha/ContextEngineering/types';
+import type { EvalContext, ServerAgentToolsContext } from '@/server/modules/Mecha';
+import { createServerAgentToolsEngine } from '@/server/modules/Mecha';
+import type { ServerUserMemoryConfig } from '@/server/modules/Mecha/ContextEngineering/types';
 import { AgentService } from '@/server/services/agent';
 import { AgentDocumentsService } from '@/server/services/agentDocuments';
 import type { AgentRuntimeServiceOptions } from '@/server/services/agentRuntime';
 import { AgentRuntimeService } from '@/server/services/agentRuntime';
 import { getAbortError, isAbortError, throwIfAborted } from '@/server/services/agentRuntime/abort';
 import { hookDispatcher } from '@/server/services/agentRuntime/hooks';
-import { type AgentHook } from '@/server/services/agentRuntime/hooks/types';
-import { type StepLifecycleCallbacks } from '@/server/services/agentRuntime/types';
+import type { AgentHook } from '@/server/services/agentRuntime/hooks/types';
+import type { StepLifecycleCallbacks } from '@/server/services/agentRuntime/types';
 import { enqueueAgentSignalSourceEvent } from '@/server/services/agentSignal';
+import { isAgentSignalEnabledForUser } from '@/server/services/agentSignal/featureGate';
 import { DocumentService } from '@/server/services/document';
 import { FileService } from '@/server/services/file';
+import { HeterogeneousAgentService } from '@/server/services/heterogeneousAgent';
 import { KlavisService } from '@/server/services/klavis';
 import { MarketService } from '@/server/services/market';
 import { deviceProxy } from '@/server/services/toolExecution/deviceProxy';
@@ -100,6 +102,35 @@ function formatErrorForMetadata(error: unknown): Record<string, any> | undefined
   return { message: String(error) };
 }
 
+const getVisualAvailabilityFromFileTypes = (fileTypes: string[]) => ({
+  hasImages: fileTypes.some((fileType) => fileType.startsWith('image')),
+  hasVideos: fileTypes.some((fileType) => fileType.startsWith('video')),
+});
+
+interface VisualAvailabilityMessage {
+  imageList?: unknown[];
+  role?: string;
+  videoList?: unknown[];
+}
+
+const getVisualAvailabilityFromMessages = (messages: VisualAvailabilityMessage[]) => ({
+  hasImages: messages.some(
+    (message) => message.role === 'user' && (message.imageList?.length ?? 0) > 0,
+  ),
+  hasVideos: messages.some(
+    (message) => message.role === 'user' && (message.videoList?.length ?? 0) > 0,
+  ),
+});
+
+const isVisualUnderstandingConfigured = () => {
+  try {
+    return !!toolsEnv.VISUAL_UNDERSTANDING_PROVIDER && !!toolsEnv.VISUAL_UNDERSTANDING_MODEL;
+  } catch {
+    // The env proxy rejects server-only keys in client-like runtimes; treat that as disabled.
+    return false;
+  }
+};
+
 /**
  * Internal params for execAgent with step lifecycle callbacks
  * This extends the public ExecAgentParams with server-side only options
@@ -113,6 +144,10 @@ interface InternalExecAgentParams extends ExecAgentParams {
   botPlatformContext?: any;
   /** Cron job ID that triggered this execution (if trigger is 'cron') */
   cronJobId?: string;
+  /** Disable only local-system while preserving other tools. Useful for signal-only evals. */
+  disableLocalSystem?: boolean;
+  /** Disable the self-iteration declaration tool for reviewer/runtime paths. */
+  disableSelfIterationIntentTool?: boolean;
   /** Disable all tools (no plugins, no system manifests). Useful for eval/benchmark scenarios. */
   disableTools?: boolean;
   /** Discord context for injecting channel/guild info into agent system message */
@@ -277,6 +312,7 @@ export class AiAgentService {
       taskId,
       evalContext,
       maxSteps,
+      disableLocalSystem,
       initialStepCount,
       signal,
       userInterventionConfig = { approvalMode: 'headless' },
@@ -587,6 +623,140 @@ export class AiAgentService {
     const model = agentConfig.model!;
     const provider = agentConfig.provider!;
 
+    // 3.5. Hetero-agent early exit — Claude Code / Codex agents bypass the
+    // server-side LLM pipeline.  After topic + message creation we hand off to
+    // the device gateway (desktop) or cloud sandbox, which will push events
+    // back via `heteroIngest` / `heteroFinish`.
+    //
+    // Detection: prefer agencyConfig.heterogeneousProvider.type (set by the UI),
+    // fall back to model field for backwards compatibility.
+    const HETERO_AGENT_MODELS = new Set<string>(['claude-code', 'codex']);
+    const heteroProviderType = agentConfig.agencyConfig?.heterogeneousProvider?.type;
+    const isHeteroAgent = !!heteroProviderType || HETERO_AGENT_MODELS.has(model);
+    if (isHeteroAgent) {
+      const heteroType = (heteroProviderType ?? model) as 'claude-code' | 'codex';
+      const operationId = nanoid();
+
+      // Create user message so the conversation is visible in the UI immediately.
+      const userMsg = effectiveResume
+        ? undefined
+        : await this.messageModel.create({
+            agentId: resolvedAgentId,
+            content: prompt,
+            role: 'user',
+            threadId: appContext?.threadId ?? undefined,
+            topicId,
+          });
+
+      // Create an assistant message placeholder (shows spinner in the UI).
+      const assistantMsg = await this.messageModel.create({
+        agentId: resolvedAgentId,
+        content: LOADING_FLAT,
+        model,
+        parentId: parentMessageId ?? userMsg?.id,
+        provider,
+        role: 'assistant',
+        threadId: appContext?.threadId ?? undefined,
+        topicId,
+      });
+      assistantMessageRef.current = assistantMsg.id;
+
+      // Read resume session id for next-turn continuity.
+      const heteroService = new HeterogeneousAgentService(this.db, this.userId);
+      const resumeSessionId = await heteroService.getHeterogeneousResumeSessionId(topicId);
+      // Sign an operation-scoped JWT so the CLI can authenticate against
+      // heteroIngest / heteroFinish without full user credentials.
+      let operationJwt: string;
+      try {
+        operationJwt = await signUserJWT(this.userId);
+      } catch (err) {
+        log('execAgent: failed to sign operation JWT for hetero run: %O', err);
+        throw new Error('Failed to sign operation JWT for hetero agent', { cause: err });
+      }
+
+      const heteroParams = {
+        agentType: heteroType,
+        jwt: operationJwt,
+        operationId,
+        prompt,
+        resumeSessionId,
+        topicId,
+        userId: this.userId,
+      };
+
+      // Seed topic.metadata.runningOperation so heteroIngest can validate the operation.
+      await this.topicModel.updateMetadata(topicId, {
+        runningOperation: {
+          assistantMessageId: assistantMsg.id,
+          operationId,
+          scope: appContext?.scope ?? undefined,
+          threadId: appContext?.threadId ?? undefined,
+        },
+      });
+
+      if (requestedDeviceId) {
+        // Dispatch to the user's connected desktop via device-gateway.
+        const result = await deviceProxy.dispatchAgentRun({
+          ...heteroParams,
+          deviceId: requestedDeviceId,
+        });
+        if (!result.success) {
+          log('execAgent: hetero device dispatch failed: %s', result.error);
+          await this.messageModel.update(assistantMsg.id, {
+            content: '',
+            error: {
+              body: { detail: result.error },
+              message: result.error ?? 'Device dispatch failed',
+              type: 'ServerAgentRuntimeError',
+            },
+          });
+          return {
+            agentId: resolvedAgentId,
+            assistantMessageId: assistantMsg.id,
+            autoStarted: false,
+            createdAt: new Date().toISOString(),
+            error: result.error,
+            message: 'Hetero agent device dispatch failed',
+            operationId,
+            status: 'error',
+            success: false,
+            timestamp: new Date().toISOString(),
+            topicId,
+            userMessageId: userMsg?.id ?? parentMessageId ?? '',
+          };
+        }
+      } else {
+        // Cloud sandbox path — fire-and-forget; errors surfaced via heteroFinish.
+        const { spawnHeteroSandbox } =
+          await import('@/server/services/heterogeneousAgent/sandboxRunner');
+        spawnHeteroSandbox({ ...heteroParams, marketService: this.marketService }).catch((err) => {
+          log('execAgent: hetero sandbox spawn failed: %O', err);
+        });
+      }
+
+      let gatewayToken: string | undefined;
+      try {
+        gatewayToken = await signUserJWT(this.userId);
+      } catch {
+        // non-critical
+      }
+
+      return {
+        agentId: resolvedAgentId,
+        assistantMessageId: assistantMsg.id,
+        autoStarted: true,
+        createdAt: new Date().toISOString(),
+        message: 'Hetero agent dispatched successfully',
+        operationId,
+        status: 'created',
+        success: true,
+        timestamp: new Date().toISOString(),
+        token: gatewayToken,
+        topicId,
+        userMessageId: userMsg?.id ?? parentMessageId ?? '',
+      };
+    }
+
     // 4. Fetch user settings (memory config + timezone)
     // Agent-level memory config takes priority; fallback to user-level setting
     const agentMemoryEnabled = agentConfig.chatConfig?.memory?.enabled;
@@ -632,6 +802,40 @@ export class AiAgentService {
 
     // model-bank is needed both for tool support check and model metadata
     const { LOBE_DEFAULT_MODEL_LIST } = await import('model-bank');
+    // Resolve S3 keys in imageList/videoList before visual tool activation checks and context build.
+    const fileService = new FileService(this.db, this.userId);
+    const postProcessUrl = (path: string | null) => fileService.getFullFileUrl(path);
+    let historyMessagesCache: any[] | undefined;
+    const loadHistoryMessages = async () => {
+      if (historyMessagesCache) return historyMessagesCache;
+
+      if (existingMessageIds.length > 0) {
+        const messages = await this.messageModel.query(
+          {
+            sessionId: appContext?.sessionId,
+            threadId: appContext?.threadId,
+            topicId: appContext?.topicId ?? undefined,
+          },
+          { postProcessUrl },
+        );
+        const idSet = new Set(existingMessageIds);
+        historyMessagesCache = messages.filter((msg) => idSet.has(msg.id));
+      } else if (appContext?.topicId) {
+        // Follow-up message in existing topic: load all history for context.
+        historyMessagesCache = await this.messageModel.query(
+          {
+            sessionId: appContext?.sessionId,
+            threadId: appContext?.threadId,
+            topicId: appContext?.topicId,
+          },
+          { postProcessUrl },
+        );
+      } else {
+        historyMessagesCache = [];
+      }
+
+      return historyMessagesCache;
+    };
 
     if (params.disableTools) {
       log('execAgent: tools disabled by disableTools flag, skipping all tool discovery');
@@ -698,12 +902,44 @@ export class AiAgentService {
         isModelSupportToolUse,
       };
 
-      // Dynamically inject topic-reference tool when prompt contains <refer_topic> tags
+      // Dynamically inject turn-scoped builtin tools.
       const hasTopicReference = /refer_topic/.test(prompt ?? '');
+      const modelAbilities =
+        LOBE_DEFAULT_MODEL_LIST.find((item) => item.id === model && item.providerId === provider)
+          ?.abilities ?? LOBE_DEFAULT_MODEL_LIST.find((item) => item.id === model)?.abilities;
+      const externalFileTypes = files?.map((file) => file.mimeType ?? '') ?? [];
+      let attachedFileTypes: string[] = [];
+      if (attachedFileIds && attachedFileIds.length > 0) {
+        const fileModel = new FileModel(this.db, this.userId);
+        const fileRecords = await fileModel.findByIds(Array.from(new Set(attachedFileIds)));
+        attachedFileTypes = fileRecords.map((file) => file.fileType || '');
+      }
+      const inputFileTypes = [...externalFileTypes, ...attachedFileTypes];
+      const inputVisualAvailability = getVisualAvailabilityFromFileTypes(inputFileTypes);
+      let historyVisualAvailability = { hasImages: false, hasVideos: false };
+      const visualUnderstandingConfigured = isVisualUnderstandingConfigured();
+
+      if (
+        visualUnderstandingConfigured &&
+        ((!modelAbilities?.vision && !inputVisualAvailability.hasImages) ||
+          (!modelAbilities?.video && !inputVisualAvailability.hasVideos))
+      ) {
+        historyVisualAvailability = getVisualAvailabilityFromMessages(await loadHistoryMessages());
+      }
+
+      const needsImageUnderstanding =
+        (inputVisualAvailability.hasImages || historyVisualAvailability.hasImages) &&
+        !modelAbilities?.vision;
+      const needsVideoUnderstanding =
+        (inputVisualAvailability.hasVideos || historyVisualAvailability.hasVideos) &&
+        !modelAbilities?.video;
+      const shouldEnableVisualUnderstanding =
+        visualUnderstandingConfigured && (needsImageUnderstanding || needsVideoUnderstanding);
       agentPlugins = [
         ...agentPlugins,
         ...(hasTopicReference ? ['lobe-topic-reference'] : []),
         ...(isBotConversation ? [MessageToolIdentifier] : []),
+        ...(shouldEnableVisualUnderstanding ? [LobeAgentManifest.identifier] : []),
       ];
 
       // Derive activeDeviceId from device context:
@@ -734,6 +970,7 @@ export class AiAgentService {
               gatewayConfigured: true,
             }
           : undefined,
+        disableLocalSystem,
         globalMemoryEnabled,
         hasAgentDocuments,
         hasEnabledKnowledgeBases,
@@ -744,14 +981,14 @@ export class AiAgentService {
 
       // 5f. Generate tools and manifest map
       const pluginIds = [
-        ...(agentConfig.plugins || []),
-        ...(additionalPluginIds || []),
-        LocalSystemManifest.identifier,
-        RemoteDeviceManifest.identifier,
-        ...(isBotConversation ? [MessageToolIdentifier] : []),
-        // Include LobeHub Skills and Klavis tools so they are passed to generateToolsDetailed
-        ...lobehubSkillManifests.map((m) => m.identifier),
-        ...klavisManifests.map((m) => m.identifier),
+        ...new Set([
+          ...agentPlugins,
+          ...(disableLocalSystem ? [] : [LocalSystemManifest.identifier]),
+          RemoteDeviceManifest.identifier,
+          // Include LobeHub Skills and Klavis tools so they are passed to generateToolsDetailed
+          ...lobehubSkillManifests.map((m) => m.identifier),
+          ...klavisManifests.map((m) => m.identifier),
+        ]),
       ];
       log('execAgent: agent configured plugins: %O', pluginIds);
 
@@ -765,7 +1002,6 @@ export class AiAgentService {
       });
 
       tools = toolsResult.tools;
-
       log('execAgent: enabled tool ids: %O', toolsResult.enabledToolIds);
 
       // Start with the scoped manifest map (pluginIds + defaultToolIds)
@@ -779,6 +1015,10 @@ export class AiAgentService {
       // (e.g., lobe-creds, lobe-cron). Exclude discoverable:false tools to prevent
       // internal infrastructure tools from being surfaced to the activator.
       for (const tool of builtinTools) {
+        if (disableLocalSystem && tool.identifier === LocalSystemManifest.identifier) {
+          continue;
+        }
+
         if (tool.discoverable !== false && !toolManifestMap[tool.identifier]) {
           toolManifestMap[tool.identifier] = tool.manifest as LobeToolManifest;
         }
@@ -845,6 +1085,27 @@ export class AiAgentService {
         lobehubSkillManifests.length,
         klavisManifests.length,
       );
+
+      const agentSelfIterationEnabled = agentConfig.chatConfig?.selfIteration?.enabled === true;
+      const shouldCheckUserSelfIterationGate =
+        agentSelfIterationEnabled && !params.disableSelfIterationIntentTool;
+      if (
+        shouldCheckUserSelfIterationGate &&
+        shouldExposeSelfIterationIntentTool({
+          agentSelfIterationEnabled,
+          disableSelfIterationIntentTool: params.disableSelfIterationIntentTool,
+          featureUserEnabled: await isAgentSignalEnabledForUser(this.db, this.userId),
+        })
+      ) {
+        tools = tools ?? [];
+        injectSelfIterationIntentTool({
+          enabledToolIds: toolsResult.enabledToolIds,
+          manifestMap: toolManifestMap,
+          sourceMap: toolSourceMap,
+          tools,
+        });
+        log('execAgent: injected self-iteration intent declaration tool');
+      }
     }
 
     // Inject client function tools from Response API
@@ -1085,35 +1346,8 @@ export class AiAgentService {
       }
     }
 
-    // 11. Get existing messages if provided
-    // Use postProcessUrl to resolve S3 keys in imageList to publicly accessible URLs,
-    // matching the frontend flow in aiChatService.getMessagesAndTopics.
-    const fileService = new FileService(this.db, this.userId);
-    const postProcessUrl = (path: string | null) => fileService.getFullFileUrl(path);
-
-    let historyMessages: any[] = [];
-    if (existingMessageIds.length > 0) {
-      historyMessages = await this.messageModel.query(
-        {
-          sessionId: appContext?.sessionId,
-          threadId: appContext?.threadId,
-          topicId: appContext?.topicId ?? undefined,
-        },
-        { postProcessUrl },
-      );
-      const idSet = new Set(existingMessageIds);
-      historyMessages = historyMessages.filter((msg) => idSet.has(msg.id));
-    } else if (appContext?.topicId) {
-      // Follow-up message in existing topic: load all history for context
-      historyMessages = await this.messageModel.query(
-        {
-          sessionId: appContext?.sessionId,
-          threadId: appContext?.threadId,
-          topicId: appContext?.topicId,
-        },
-        { postProcessUrl },
-      );
-    }
+    // 11. Get existing messages if provided.
+    const historyMessages = await loadHistoryMessages();
 
     await throwIfExecutionAborted('message history loading');
 
@@ -1373,6 +1607,7 @@ export class AiAgentService {
     const userMessage = {
       content: prompt,
       fileList,
+      id: userMessageRecord?.id,
       imageList,
       role: 'user' as const,
       videoList,
