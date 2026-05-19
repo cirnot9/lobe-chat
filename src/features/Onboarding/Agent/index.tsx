@@ -3,6 +3,8 @@
 import { BUILTIN_AGENT_SLUGS } from '@lobechat/builtin-agents';
 import { setAgentTemplatesFetcher } from '@lobechat/builtin-tool-web-onboarding/agentMarketplace';
 import { SESSION_CHAT_TOPIC_URL } from '@lobechat/const';
+import type { SendMessageParams } from '@lobechat/types';
+import { RequestTrigger } from '@lobechat/types';
 import { Button, ErrorBoundary, Flexbox } from '@lobehub/ui';
 import { Drawer } from 'antd';
 import { History } from 'lucide-react';
@@ -11,14 +13,16 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 
 import Loading from '@/components/Loading/BrandTextLoading';
+import { ONBOARDING_PRODUCTION_DEFAULT_MODEL } from '@/const/onboarding';
 import ModeSwitch from '@/features/Onboarding/components/ModeSwitch';
 import { useClientDataSWR, useOnlyFetchOnceSWR } from '@/libs/swr';
 import OnboardingContainer from '@/routes/onboarding/_layout';
 import { fetchOnboardingAgentTemplates } from '@/services/agentMarketplace';
+import { messageService } from '@/services/message';
 import { topicService } from '@/services/topic';
 import { userService } from '@/services/user';
 import { useAgentStore } from '@/store/agent';
-import { builtinAgentSelectors } from '@/store/agent/selectors';
+import { agentByIdSelectors, builtinAgentSelectors } from '@/store/agent/selectors';
 import { useChatStore } from '@/store/chat';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
 import { useUserStore } from '@/store/user';
@@ -51,6 +55,9 @@ const AgentOnboardingPage = memo(() => {
   const refreshBuiltinAgent = useAgentStore((s) => s.refreshBuiltinAgent);
   const onboardingAgentId = useAgentStore(
     builtinAgentSelectors.getBuiltinAgentId(BUILTIN_AGENT_SLUGS.webOnboarding),
+  );
+  const onboardingAgentConfig = useAgentStore((s) =>
+    onboardingAgentId ? agentByIdSelectors.getAgentConfigById(onboardingAgentId)(s) : undefined,
   );
   const inboxAgentId = useAgentStore(
     builtinAgentSelectors.getBuiltinAgentId(BUILTIN_AGENT_SLUGS.inbox),
@@ -115,16 +122,59 @@ const AgentOnboardingPage = memo(() => {
     [onboardingAgentId, effectiveTopicId],
   );
   const messagesForOnboarding = useChatStore((s) => s.dbMessagesMap[onboardingChatKey]);
-  const isGreeting = useMemo(() => {
-    if (!messagesForOnboarding || messagesForOnboarding.length !== 1) return false;
-    return messagesForOnboarding[0]?.role !== 'user';
-  }, [messagesForOnboarding]);
+  // No persisted welcome message: greeting = no messages yet.
+  const isGreeting = useMemo(
+    () => !messagesForOnboarding || messagesForOnboarding.length === 0,
+    [messagesForOnboarding],
+  );
+  const onboardingFollowUpModelConfig = useMemo(
+    () => ({
+      model: onboardingAgentConfig?.model ?? ONBOARDING_PRODUCTION_DEFAULT_MODEL.model,
+      provider: onboardingAgentConfig?.provider ?? ONBOARDING_PRODUCTION_DEFAULT_MODEL.provider,
+    }),
+    [onboardingAgentConfig?.model, onboardingAgentConfig?.provider],
+  );
 
   const onboardingFollowUp = useOnboardingFollowUp({
     enabled: !onboardingFinished && !viewingHistoricalTopic,
     isGreeting,
+    modelConfig: onboardingFollowUpModelConfig,
   });
   const { onBeforeSendMessage, triggerExtract } = onboardingFollowUp;
+
+  const composedOnBeforeSendMessage = useCallback(
+    async (params: SendMessageParams) => {
+      params.metadata = { ...params.metadata, trigger: RequestTrigger.Onboarding };
+
+      const welcomeContent = t('agent.welcome');
+      await onBeforeSendMessage();
+
+      if (!onboardingAgentId || !effectiveTopicId) return;
+
+      const currentMessages = useChatStore.getState().dbMessagesMap[onboardingChatKey];
+      if (currentMessages && currentMessages.length > 0) return;
+
+      const result = await messageService.createMessage({
+        agentId: onboardingAgentId,
+        content: welcomeContent,
+        role: 'assistant',
+        topicId: effectiveTopicId,
+      });
+
+      // Sync the local cache so any subsequent reads see the welcome.
+      useChatStore.setState((state) => ({
+        dbMessagesMap: {
+          ...state.dbMessagesMap,
+          [onboardingChatKey]: result.messages,
+        },
+      }));
+
+      // Force the in-flight sendMessage to use the welcome as LLM history,
+      // since its `displayMessages` snapshot was captured before this hook ran.
+      params.messages = result.messages;
+    },
+    [effectiveTopicId, onBeforeSendMessage, onboardingAgentId, onboardingChatKey, t],
+  );
 
   const syncOnboardingContext = useCallback(async () => {
     const nextContext = await userService.getOrCreateOnboardingState();
@@ -167,6 +217,11 @@ const AgentOnboardingPage = memo(() => {
   const assistantTurnSettledHandler =
     onboardingFinished || viewingHistoricalTopic ? undefined : handleAssistantTurnSettled;
 
+  const conversationHooks = useMemo(
+    () => (onboardingFinished ? undefined : { onBeforeSendMessage: composedOnBeforeSendMessage }),
+    [onboardingFinished, composedOnBeforeSendMessage],
+  );
+
   if (error) {
     return (
       <OnboardingContainer>
@@ -198,14 +253,8 @@ const AgentOnboardingPage = memo(() => {
         <OnboardingConversationProvider
           agentId={onboardingAgentId}
           frozen={onboardingFinished}
+          hooks={conversationHooks}
           topicId={effectiveTopicId}
-          hooks={
-            onboardingFinished
-              ? undefined
-              : {
-                  onBeforeSendMessage,
-                }
-          }
         >
           <ErrorBoundary fallbackRender={() => null}>
             <AgentOnboardingConversation
@@ -240,9 +289,9 @@ const AgentOnboardingPage = memo(() => {
           </Drawer>
         )}
       </Flexbox>
-      <ModeSwitch
-        actions={
-          isDev ? (
+      {isDev && (
+        <ModeSwitch
+          actions={
             <>
               <AgentOnboardingDebugExportButton
                 agentId={onboardingAgentId}
@@ -261,9 +310,9 @@ const AgentOnboardingPage = memo(() => {
                 {t('agent.modeSwitch.reset')}
               </Button>
             </>
-          ) : undefined
-        }
-      />
+          }
+        />
+      )}
     </OnboardingContainer>
   );
 });

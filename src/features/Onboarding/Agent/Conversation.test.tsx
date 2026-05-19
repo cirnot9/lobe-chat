@@ -76,7 +76,7 @@ vi.mock('@/features/Conversation/hooks/useAgentMeta', () => ({
 }));
 
 vi.mock('./Welcome', () => ({
-  default: ({ content }: { content: string }) => <div data-testid="welcome-content">{content}</div>,
+  default: () => <div data-testid="welcome-content">Welcome</div>,
 }));
 
 describe('AgentOnboardingConversation', () => {
@@ -98,7 +98,7 @@ describe('AgentOnboardingConversation', () => {
   });
 
   it('renders the onboarding greeting without any completion CTA', () => {
-    mockState.displayMessages = [{ content: 'Welcome', id: 'assistant-1', role: 'assistant' }];
+    mockState.displayMessages = [];
 
     render(<AgentOnboardingConversation />);
 
@@ -122,7 +122,7 @@ describe('AgentOnboardingConversation', () => {
     );
   });
 
-  it('disables / @ triggers, follow-up placeholder, and message queueing', () => {
+  it('disables input completion, / @ triggers, follow-up placeholder, and message queueing', () => {
     mockState.displayMessages = [{ id: 'assistant-1', role: 'assistant' }];
 
     render(<AgentOnboardingConversation />);
@@ -130,9 +130,12 @@ describe('AgentOnboardingConversation', () => {
     expect(chatInputSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         disableFollowUpVariant: true,
-        disableMention: true,
         disableQueue: true,
-        disableSlash: true,
+        feature: expect.objectContaining({
+          inputCompletion: false,
+          mention: false,
+          slash: false,
+        }),
       }),
     );
   });

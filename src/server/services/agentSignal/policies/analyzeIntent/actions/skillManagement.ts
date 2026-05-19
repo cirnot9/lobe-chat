@@ -27,6 +27,7 @@ import {
   AGENT_SKILL_CREATE_SYSTEM_ROLE,
   AGENT_SKILL_MANAGER_DECISION_SYSTEM_ROLE,
   AGENT_SKILL_REFINE_SYSTEM_ROLE,
+  createAgentSignalSkillLanguageInstruction,
   createAgentSkillConsolidatePrompt,
   createAgentSkillCreatePrompt,
   createAgentSkillManagerDecisionPrompt,
@@ -55,13 +56,13 @@ import type {
 
 import type { RuntimeProcessorContext } from '../../../runtime/context';
 import { defineActionHandler } from '../../../runtime/middleware';
-import { createSkillManagementService } from '../../../services/maintenance/skill';
+import { createSkillManagementService } from '../../../services/selfIteration/tools/shared';
 import type { ProcedureStateService } from '../../../services/types';
 import { hasAppliedActionIdempotency, markAppliedActionIdempotency } from '../../actionIdempotency';
 import type { ActionSkillManagementHandle, AgentSignalFeedbackEvidence } from '../../types';
 import { AGENT_SIGNAL_POLICY_ACTION_TYPES } from '../../types';
 import { createFeedbackActionPlannerSignalHandler } from '../feedbackAction';
-import type { DeferredSkillCandidate } from '../skillCandidate';
+import type { RecordedSkillIntent } from '../skillIntentRecord';
 
 export interface SkillManagementCandidateSkill {
   id: string;
@@ -143,8 +144,10 @@ export interface SkillManagementActionInput {
 
 export interface SkillManagementActionHandlerOptions {
   db: LobeChatDatabase;
-  /** Optional procedure state used to read user-stage skill candidates. */
-  procedureState?: Pick<ProcedureStateService, 'skillCandidates'>;
+  /** Optional procedure state used to read user-stage skill intent records. */
+  procedureState?: Pick<ProcedureStateService, 'skillIntentRecords'>;
+  /** User-visible response language used as the default for newly-authored skill artifacts. */
+  responseLanguage?: string;
   selfIterationEnabled: boolean;
   skillCandidateSkillsFactory?: (input: {
     agentId: string;
@@ -152,6 +155,8 @@ export interface SkillManagementActionHandlerOptions {
   skillCreateRunner?: (input: SkillCreateAuthoringInput) => Promise<unknown>;
   skillDecisionModel?: SkillManagementAgentModelConfig;
   skillDecisionRunner?: (input: SkillManagementSignalPayload) => Promise<unknown>;
+  /** Optional factory used to inspect same-turn document outcomes before decision. */
+  skillDecisionToolsetFactory?: (input: { agentId: string }) => SkillDecisionToolset;
   skillMaintainerRunner?: (input: SkillMaintainerWorkflowInput) => Promise<unknown>;
   skillManagementServiceFactory?: (input: { agentId: string }) => SkillManagementOperationService;
   userId: string;
@@ -174,6 +179,7 @@ export interface SkillDecisionCandidateDocument {
 export interface SkillDecisionDocumentSnapshot {
   agentDocumentId: string;
   content?: string;
+  description?: string | null;
   documentId?: string;
   filename?: string;
   metadata?: Record<string, unknown>;
@@ -234,36 +240,36 @@ export const readAgentSignalHintIsSkill = (metadata: unknown): boolean | undefin
   return typeof hintIsSkill === 'boolean' ? hintIsSkill : undefined;
 };
 
-const createDeferredSkillCandidateEvidence = (
-  candidate: DeferredSkillCandidate | undefined,
+const createRecordedSkillIntentEvidence = (
+  record: RecordedSkillIntent | undefined,
 ): AgentSignalFeedbackEvidence[] => {
-  if (!candidate) return [];
+  if (!record) return [];
 
   return [
     {
-      cue: 'deferred_skill_candidate',
-      excerpt: `${candidate.explicitness}/${candidate.route}/${candidate.actionIntent ?? 'none'}: ${
-        candidate.reason ?? 'deferred skill intent'
+      cue: 'recorded_skill_intent',
+      excerpt: `${record.explicitness}/${record.route}/${record.actionIntent ?? 'none'}: ${
+        record.reason ?? 'recorded skill intent'
       }`,
     },
   ];
 };
 
-const readDeferredSkillCandidateForAction = async (
+const readRecordedSkillIntentForExecution = async (
   options: SkillManagementActionHandlerOptions,
   action: ActionSkillManagementHandle,
   context: RuntimeProcessorContext,
 ) => {
-  const reader = options.procedureState?.skillCandidates?.read;
+  const reader = options.procedureState?.skillIntentRecords?.read;
   if (!reader) return undefined;
 
   const messageId = action.payload.messageId;
   if (messageId) {
-    const candidate = await reader({
+    const record = await reader({
       scopeKey: context.scopeKey,
       sourceId: messageId,
     });
-    if (candidate) return candidate;
+    if (record) return record;
   }
 
   const sourceId = action.source?.sourceId;
@@ -282,6 +288,8 @@ export interface SkillManagementAgentModelConfig {
 
 export interface SkillMaintainerWorkflowInput {
   decision: SkillManagementDecision;
+  /** Language instruction block for persisted skill artifact text. */
+  languageInstruction?: string;
   signal: SkillManagementActionInput;
   targetSkills: Array<{
     content: string;
@@ -306,6 +314,8 @@ export interface SkillMaintainerWorkflowResult {
 export interface SkillCreateAuthoringInput {
   candidateSkills?: SkillManagementCandidateSkill[];
   decision: SkillManagementDecision;
+  /** Language instruction block for persisted skill artifact text. */
+  languageInstruction?: string;
   signal: SkillManagementActionInput;
   sourceAgentDocumentId?: string;
   sourceDocumentContent?: string;
@@ -866,7 +876,7 @@ export const runSkillDecisionAgentRuntime = async (input: SkillDecisionAgentRunt
 };
 
 /**
- * Handles one skill-domain Agent Signal payload.
+ * Executes the skill-management decision step for one skill-domain action payload.
  *
  * Use when:
  * - Feedback has already been routed into the skill domain
@@ -878,7 +888,7 @@ export const runSkillDecisionAgentRuntime = async (input: SkillDecisionAgentRunt
  * Returns:
  * - A skipped status when disabled, otherwise the decision result
  */
-export const handleSkillManagementSignal = async (input: {
+export const executeSkillManagementDecision = async (input: {
   decide: (payload: SkillManagementSignalPayload) => Promise<unknown>;
   payload: SkillManagementSignalPayload;
   selfIterationEnabled: boolean;
@@ -1002,6 +1012,13 @@ const createDefaultSkillDecisionToolset = (
       );
     },
     readDocument: async ({ agentDocumentId }) => {
+      // NOTICE:
+      // This is the Agent Signal decision-only inspection tool, not the chat-visible
+      // lobe-agent-documents.readDocument tool and not a skill runtime document tool.
+      // The decision agent needs a read-only snapshot to evaluate hinted same-turn documents
+      // without invoking user-facing tool permissions or mutating agent document state.
+      // Keep this boundary until Agent Signal decision tools are unified with a scoped
+      // read-only tool registry.
       const snapshot = await agentDocumentsService.getDocumentSnapshotById(agentDocumentId);
       if (!snapshot) return { agentDocumentId };
 
@@ -1015,6 +1032,101 @@ const createDefaultSkillDecisionToolset = (
       };
     },
   };
+};
+
+const hintedDocumentEvidenceContentLength = 200;
+
+/**
+ * Normalizes document evidence for compact decision prompts.
+ *
+ * Before:
+ * - "# Title\n\nLong body..."
+ *
+ * After:
+ * - "# Title Long body..."
+ */
+const toCompactDocumentEvidenceExcerpt = (content: string) => {
+  const normalized = content.replaceAll(/\s+/g, ' ').trim();
+
+  if (normalized.length <= hintedDocumentEvidenceContentLength) return normalized;
+
+  return `${normalized.slice(0, hintedDocumentEvidenceContentLength)}...`;
+};
+
+const getDocumentDescription = (document: SkillDecisionDocumentSnapshot) => {
+  const description = document.description?.trim();
+
+  if (description) return description;
+
+  const metadataDescription = document.metadata?.description;
+  return typeof metadataDescription === 'string' && metadataDescription.trim()
+    ? metadataDescription.trim()
+    : undefined;
+};
+
+const getSkillDecisionToolset = (options: SkillManagementActionHandlerOptions, agentId: string) =>
+  options.skillDecisionToolsetFactory?.({ agentId }) ??
+  createDefaultSkillDecisionToolset(options.db, options.userId);
+
+const collectHintedSameTurnDocumentEvidence = async (
+  input: {
+    agentId: string;
+    messageId?: string;
+    scopeKey: string;
+    topicId?: string;
+  },
+  options: SkillManagementActionHandlerOptions,
+): Promise<AgentSignalFeedbackEvidence[]> => {
+  if (!input.messageId) return [];
+
+  const tools = getSkillDecisionToolset(options, input.agentId);
+  const outcomes = await tools.listSameTurnDocumentOutcomes({
+    agentId: input.agentId,
+    messageId: input.messageId,
+    scopeKey: input.scopeKey,
+    topicId: input.topicId,
+  });
+  const hintedOutcomes = outcomes.filter((outcome) => outcome.hintIsSkill === true);
+
+  if (hintedOutcomes.length === 0) return [];
+
+  const evidence: AgentSignalFeedbackEvidence[] = [];
+
+  for (const outcome of hintedOutcomes) {
+    evidence.push({
+      cue: 'same_turn_hinted_document',
+      excerpt: [
+        `agentDocumentId=${outcome.agentDocumentId}`,
+        `hintIsSkill=true`,
+        outcome.relation ? `relation=${outcome.relation}` : undefined,
+        outcome.summary ? `summary=${outcome.summary}` : undefined,
+      ]
+        .filter(Boolean)
+        .join('; '),
+    });
+
+    const document = await tools.readDocument({ agentDocumentId: outcome.agentDocumentId });
+    const description = getDocumentDescription(document);
+
+    evidence.push({
+      cue: description
+        ? 'same_turn_hinted_document_description'
+        : 'same_turn_hinted_document_content',
+      excerpt: [
+        `agentDocumentId=${outcome.agentDocumentId}`,
+        document.title ? `title=${document.title}` : undefined,
+        description
+          ? `description=${description}`
+          : document.content
+            ? `content=${toCompactDocumentEvidenceExcerpt(document.content)}`
+            : undefined,
+      ]
+        .filter(Boolean)
+        .join('; '),
+    });
+  }
+
+  return evidence;
 };
 
 const toSkillMaintainerWorkflowResult = (
@@ -1052,6 +1164,7 @@ class SkillManagementDecisionAgentService {
     private db: LobeChatDatabase,
     private userId: string,
     modelConfig: Partial<SkillManagementAgentModelConfig> = {},
+    private toolsetFactory?: SkillManagementActionHandlerOptions['skillDecisionToolsetFactory'],
   ) {
     this.modelConfig = {
       model: modelConfig.model ?? DEFAULT_MINI_SYSTEM_AGENT_ITEM.model,
@@ -1078,7 +1191,9 @@ class SkillManagementDecisionAgentService {
         ...input,
         ...(candidateSkills.length > 0 ? { candidateSkills } : {}),
       },
-      tools: createDefaultSkillDecisionToolset(this.db, this.userId),
+      tools:
+        this.toolsetFactory?.({ agentId: input.agentId }) ??
+        createDefaultSkillDecisionToolset(this.db, this.userId),
     });
 
     return toSkillManagementDecision(
@@ -1117,6 +1232,7 @@ class SkillMaintainerWorkflowAgentService {
     const isRefine = input.type === 'refine';
     const content = isRefine
       ? createAgentSkillRefinePrompt({
+          languageInstruction: input.languageInstruction,
           reason: input.decision.reason ?? input.signal.reason ?? 'Refine selected skill.',
           signalContext: {
             evidence: input.signal.evidence,
@@ -1128,6 +1244,7 @@ class SkillMaintainerWorkflowAgentService {
           skillMetadata: input.targetSkills[0]?.metadata ?? {},
         })
       : createAgentSkillConsolidatePrompt({
+          languageInstruction: input.languageInstruction,
           reason: input.decision.reason ?? input.signal.reason ?? 'Consolidate selected skills.',
           sourceSkills: input.targetSkills,
         });
@@ -1190,6 +1307,7 @@ class SkillCreateAuthoringAgentService {
               ...(input.candidateSkills?.length ? { candidateSkills: input.candidateSkills } : {}),
               evidence: input.signal.evidence ?? [],
               feedbackMessage: input.signal.message,
+              languageInstruction: input.languageInstruction,
               sourceAgentDocumentId: input.sourceAgentDocumentId,
               sourceDocumentContent: input.sourceDocumentContent,
               turnContext: input.signal.serializedContext,
@@ -1262,6 +1380,7 @@ export const createSkillDecisionRunner = (options: SkillManagementActionHandlerO
     options.db,
     options.userId,
     options.skillDecisionModel,
+    options.skillDecisionToolsetFactory,
   );
 
   return (input: SkillManagementSignalPayload) => agent.decide(input);
@@ -1296,6 +1415,11 @@ const isMaintainerDecision = (
 ): decision is SkillManagementDecision & { action: 'consolidate' | 'refine' } =>
   decision.action === 'refine' || decision.action === 'consolidate';
 
+/**
+ * Checks whether a model-selected source document ref can be queried as agent_documents.id.
+ */
+const isAgentDocumentDatabaseId = (value: string) => z.string().uuid().safeParse(value).success;
+
 const toSkillActionTarget = (
   skill: Pick<SkillSummary, 'bundle' | 'description' | 'index' | 'title'>,
 ): SkillManagementActionTarget => ({
@@ -1320,6 +1444,26 @@ const readTargetSkills = async (
 
   return results.filter((skill): skill is SkillDetail => Boolean(skill));
 };
+
+const readSkillPrimaryLanguage = (skill?: SkillDetail) => {
+  const frontmatter = skill?.frontmatter;
+  if (!frontmatter || typeof frontmatter !== 'object') return undefined;
+
+  const language = (frontmatter as unknown as Record<string, unknown>).language;
+
+  return typeof language === 'string' && language.trim().length > 0 ? language.trim() : undefined;
+};
+
+const createSkillArtifactLanguageInstruction = (input: {
+  existingSkillLanguage?: string;
+  mode: 'consolidate' | 'create' | 'refine';
+  responseLanguage?: string;
+}) =>
+  createAgentSignalSkillLanguageInstruction({
+    existingSkillLanguage: input.existingSkillLanguage,
+    mode: input.mode,
+    responseLanguage: input.responseLanguage ?? 'en-US',
+  });
 
 const runMaintainerWorkflow = async (
   input: SkillManagementActionInput,
@@ -1371,6 +1515,11 @@ const runMaintainerWorkflow = async (
     SkillMaintainerWorkflowResultSchema.parse(
       await workflowRunner({
         decision,
+        languageInstruction: createSkillArtifactLanguageInstruction({
+          existingSkillLanguage: readSkillPrimaryLanguage(targetSkills[0]),
+          mode: decision.action,
+          responseLanguage: options.responseLanguage,
+        }),
         signal: input,
         targetSkills: targetSkills.map((skill) => ({
           content: skill.content ?? '',
@@ -1395,7 +1544,7 @@ const runMaintainerWorkflow = async (
   let updatedSkill: SkillDetail | SkillSummary = canonical;
 
   try {
-    const skillMaintenanceService = createSkillManagementService({
+    const selfIterationSkillService = createSkillManagementService({
       consolidateSkill: async () => {
         if (workflowResult.rename?.newName || workflowResult.rename?.newTitle) {
           updatedSkill =
@@ -1451,7 +1600,7 @@ const runMaintainerWorkflow = async (
     });
 
     if (decision.action === 'consolidate') {
-      await skillMaintenanceService.consolidateSkill({
+      await selfIterationSkillService.consolidateSkill({
         evidenceRefs: [],
         idempotencyKey: `same-turn-skill:${canonical.bundle.agentDocumentId}`,
         input: {
@@ -1462,11 +1611,11 @@ const runMaintainerWorkflow = async (
         },
       });
     } else {
-      await skillMaintenanceService.refineSkill({
+      await selfIterationSkillService.refineSkill({
         evidenceRefs: [],
         idempotencyKey: `same-turn-skill:${canonical.bundle.agentDocumentId}`,
         input: {
-          patch: workflowResult.bodyMarkdown,
+          bodyMarkdown: workflowResult.bodyMarkdown,
           skillDocumentId: canonical.bundle.agentDocumentId,
           userId: options.userId,
         },
@@ -1496,6 +1645,10 @@ const readCreateSourceDocument = async (
   const sourceAgentDocumentId = decision.documentRefs?.[0];
 
   if (!input.agentId || !sourceAgentDocumentId) {
+    return {};
+  }
+
+  if (!isAgentDocumentDatabaseId(sourceAgentDocumentId)) {
     return {};
   }
 
@@ -1538,8 +1691,13 @@ const runCreateWorkflow = async (
       await createRunner({
         candidateSkills: input.candidateSkills,
         decision,
+        languageInstruction: createSkillArtifactLanguageInstruction({
+          mode: 'create',
+          responseLanguage: options.responseLanguage,
+        }),
         signal: input,
-        ...source,
+        sourceAgentDocumentId: source?.sourceAgentDocumentId,
+        sourceDocumentContent: source?.sourceDocumentContent,
       }),
     ),
   );
@@ -1549,7 +1707,7 @@ const runCreateWorkflow = async (
 
   try {
     let createdSkill: SkillDetail | undefined;
-    const skillMaintenanceService = createSkillManagementService({
+    const selfIterationSkillService = createSkillManagementService({
       createSkill: async () => {
         const skill = await service.createSkill({
           agentId,
@@ -1567,7 +1725,7 @@ const runCreateWorkflow = async (
         };
       },
     });
-    await skillMaintenanceService.createSkill({
+    await selfIterationSkillService.createSkill({
       evidenceRefs: [],
       idempotencyKey: `same-turn-skill:create:${authored.name}`,
       input: {
@@ -1638,7 +1796,25 @@ export const runSkillManagementAction = async (
   return runCreateWorkflow(input, options, decision);
 };
 
-export const handleSkillManagementAction = async (
+/**
+ * Executes one skill-management action by collecting evidence, deciding, and applying mutations.
+ *
+ * Triggering workflow:
+ *
+ * {@link defineSkillManagementActionHandler}
+ *   -> `action.skill-management.handle`
+ *     -> {@link executeSkillManagementAction}
+ *       -> {@link executeSkillManagementDecision}
+ *
+ * Upstream:
+ * - {@link defineSkillManagementActionHandler}
+ *
+ * Downstream:
+ * - {@link executeSkillManagementDecision}
+ * - {@link runMaintainerWorkflow}
+ * - {@link runCreateWorkflow}
+ */
+export const executeSkillManagementAction = async (
   action: BaseAction,
   options: SkillManagementActionHandlerOptions,
   context: RuntimeProcessorContext,
@@ -1692,10 +1868,20 @@ export const handleSkillManagementAction = async (
     }
 
     const candidateSkills = await resolveSkillDecisionCandidates(options, action.payload.agentId);
-    const deferredCandidate = await readDeferredSkillCandidateForAction(options, action, context);
+    const recordedIntent = await readRecordedSkillIntentForExecution(options, action, context);
+    const sameTurnDocumentEvidence = await collectHintedSameTurnDocumentEvidence(
+      {
+        agentId: action.payload.agentId,
+        messageId: action.payload.messageId,
+        scopeKey: context.scopeKey,
+        topicId: action.payload.topicId,
+      },
+      options,
+    );
     const evidence = [
       ...(action.payload.evidence ?? []),
-      ...createDeferredSkillCandidateEvidence(deferredCandidate),
+      ...sameTurnDocumentEvidence,
+      ...createRecordedSkillIntentEvidence(recordedIntent),
     ];
     const runnerInput = {
       agentId: action.payload.agentId,
@@ -1708,7 +1894,7 @@ export const handleSkillManagementAction = async (
       serializedContext: action.payload.serializedContext,
       topicId: action.payload.topicId,
     };
-    const decisionResult = await handleSkillManagementSignal({
+    const decisionResult = await executeSkillManagementDecision({
       decide: options.skillDecisionRunner ?? createSkillDecisionRunner(options),
       payload: {
         agentId: action.payload.agentId,
@@ -1779,7 +1965,7 @@ export const handleSkillManagementAction = async (
  * - {@link createFeedbackActionPlannerSignalHandler}
  *
  * Downstream:
- * - {@link runSkillManagementAction}
+ * - {@link executeSkillManagementAction}
  * - {@link SkillManagementDocumentService}
  */
 export const defineSkillManagementActionHandler = (
@@ -1789,7 +1975,7 @@ export const defineSkillManagementActionHandler = (
     AGENT_SIGNAL_POLICY_ACTION_TYPES.skillManagementHandle,
     'handler.skill-management.handle',
     async (action, context: RuntimeProcessorContext) => {
-      return handleSkillManagementAction(action, options, context);
+      return executeSkillManagementAction(action, options, context);
     },
   );
 };

@@ -1,10 +1,14 @@
 'use client';
 
+import {
+  WebOnboardingApiName,
+  WebOnboardingIdentifier,
+} from '@lobechat/builtin-tool-web-onboarding';
 import { Flexbox } from '@lobehub/ui';
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 
-import type { ActionKeys } from '@/features/ChatInput';
+import type { ActionKeys, ChatInputFeature } from '@/features/ChatInput';
 import {
   ChatInput,
   ChatList,
@@ -39,6 +43,11 @@ interface AgentOnboardingConversationProps {
 
 const chatInputLeftActions: ActionKeys[] = isDev ? ['model'] : [];
 const chatInputRightActions: ActionKeys[] = [];
+const chatInputFeature = {
+  inputCompletion: false,
+  mention: false,
+  slash: false,
+} satisfies ChatInputFeature;
 
 const AgentOnboardingConversation = memo<AgentOnboardingConversationProps>(
   ({
@@ -57,12 +66,25 @@ const AgentOnboardingConversation = memo<AgentOnboardingConversationProps>(
     const pendingInterventionCount = useConversationStore(
       (s) => dataSelectors.pendingInterventions(s).length,
     );
+    // The agent-marketplace intervention renders as an absolute overlay anchored
+    // to the chat input area, which would otherwise occlude the last message.
+    // Reserve matching scroll headroom inside ChatList so the latest message can
+    // still be scrolled into view above the marketplace panel.
+    const hasAgentMarketplaceIntervention = useConversationStore((s) =>
+      dataSelectors
+        .pendingInterventions(s)
+        .some(
+          (i) =>
+            i.identifier === WebOnboardingIdentifier &&
+            i.apiName === WebOnboardingApiName.showAgentMarketplace,
+        ),
+    );
 
-    const isGreetingState = useMemo(() => {
-      if (displayMessages.length !== 1) return false;
-      const first = displayMessages[0];
-      return assistantLikeRoles.has(first.role);
-    }, [displayMessages]);
+    // The welcome ("AI opens") is rendered client-side from i18n until the
+    // user sends their first message — at which point the welcome and the
+    // user's reply are persisted together. Greeting state is therefore the
+    // pre-conversation period when no messages have been recorded yet.
+    const isGreetingState = useMemo(() => displayMessages.length === 0, [displayMessages]);
 
     const latestAssistantMessageId = useMemo(() => {
       const latest = displayMessages.at(-1);
@@ -129,12 +151,22 @@ const AgentOnboardingConversation = memo<AgentOnboardingConversationProps>(
 
     const greetingWelcome = useMemo(() => {
       if (!shouldShowGreetingWelcome) return undefined;
+      return <Welcome />;
+    }, [shouldShowGreetingWelcome]);
 
-      const message = displayMessages[0];
-      if (!message || typeof message.content !== 'string') return undefined;
-
-      return <Welcome content={message.content} />;
-    }, [displayMessages, shouldShowGreetingWelcome]);
+    const agentMarketplaceSpacer = useMemo(() => {
+      if (!hasAgentMarketplaceIntervention) return undefined;
+      return (
+        <div
+          aria-hidden
+          style={{
+            height: 'min(640px, 72vh)',
+            minHeight: 480,
+            pointerEvents: 'none',
+          }}
+        />
+      );
+    }, [hasAgentMarketplaceIntervention]);
 
     if (onboardingFinished)
       return (
@@ -165,6 +197,7 @@ const AgentOnboardingConversation = memo<AgentOnboardingConversationProps>(
       <Flexbox flex={1} height={'100%'}>
         <Flexbox flex={1} style={{ overflow: 'hidden' }}>
           <ChatList
+            footerSlot={agentMarketplaceSpacer}
             itemContent={itemContent}
             showWelcome={shouldShowGreetingWelcome}
             welcome={listWelcome}
@@ -184,10 +217,9 @@ const AgentOnboardingConversation = memo<AgentOnboardingConversationProps>(
             )}
             <ChatInput
               disableFollowUpVariant
-              disableMention
               disableQueue
-              disableSlash
               allowExpand={false}
+              feature={chatInputFeature}
               leftActions={chatInputLeftActions}
               rightActions={chatInputRightActions}
               showRuntimeConfig={false}
