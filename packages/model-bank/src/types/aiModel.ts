@@ -218,9 +218,9 @@ export interface AIBaseModelCard {
   displayName?: string;
   enabled?: boolean;
   /**
-   * model lineage, finer than `organization` (e.g. 'claude', 'gpt', 'o-series',
-   * 'qwen', 'deepseek'). Lets the UI group models and match the same model
-   * across aggregator providers.
+   * product-line lineage, finer than `organization` (e.g. 'claude-opus',
+   * 'claude-mythos', 'gpt', 'o-series', 'qwen'). Families contain generations;
+   * lets the UI group models and match the same model across aggregator providers.
    */
   family?: string;
   /**
@@ -286,6 +286,7 @@ export type ExtendParamsType =
   | 'grok4_20ReasoningEffort'
   | 'grok4_3ReasoningEffort'
   | 'hy3ReasoningEffort'
+  | 'ring2_6ReasoningEffort'
   | 'codexMaxReasoningEffort'
   | 'opus47Effort'
   | 'step3_5ReasoningEffort'
@@ -337,6 +338,7 @@ export const ExtendParamsTypeSchema = z.enum([
   'grok4_20ReasoningEffort',
   'grok4_3ReasoningEffort',
   'hy3ReasoningEffort',
+  'ring2_6ReasoningEffort',
   'codexMaxReasoningEffort',
   'opus47Effort',
   'step3_5ReasoningEffort',
